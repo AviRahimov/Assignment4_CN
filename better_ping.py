@@ -1,31 +1,38 @@
+"""
+This script implements a better ping functionality using ICMP and a watchdog process with multithreading.
+It allows sending ICMP echo request packets to a specified IP address and receiving ICMP echo reply packets.
+The script also communicates with a watchdog process over TCP with port 3000.
+
+The script consists of the following functions:
+"""
+
 import errno
 import socket
 import struct
 import sys
-import threading
 import time
+import threading
 
-from ping import ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST
 from watchdog import create_watchdog_tcp_socket
+from ping import ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST
 
-# constants
+# Constants
 WATCHDOG_PORT = 3000
 WATCHDOG_IP = 'localhost'
 
-# global
-host = 0
-seq = 0
-
+# Global variables
+destination_host = 0
+sequence_number = 0
 
 def calculate_checksum(packet) -> int:
     """
-    the code provided in the course
-    :param packet: the packet that calculated with the checksum
-    :return: calculated checksum
-    """
-    """
-    :param packet: 
-    :return: 
+    Calculates the checksum of the given packet.
+
+    param:
+        packet: The packet data for calculating the checksum.
+
+    return:
+        The calculated checksum value as an integer.
     """
     checksum = 0
     count_to = (len(packet) // 2) * 2
@@ -38,120 +45,167 @@ def calculate_checksum(packet) -> int:
     return (~checksum) & 0xFFFF
 
 
-# Create an ICMP packet
-def create_packet(payload_size: int) -> bytes:
+def create_icmp_echo_request_packet():
     """
-    Creates an ICMP packet with the specified payload size.
-    :param payload_size: Size of the payload
-    :return: ICMP packet
+    Creates an ICMP echo request packet.
+
+    return:
+        A tuple containing the packet data and the raw packet.
     """
-    global cmp_seq_number
-    cmp_seq_number += 1
-    packet = struct.pack('!BBHHH', ICMP_ECHO_REQUEST, 0, 0, 0, cmp_seq_number)  # Create the ICMP header
-    data = b'P' * payload_size  # Create the payload data
-    packet += data
-    checksum = calculate_checksum(packet)
-    # creates an header with checksum
-    header = struct.pack('!BBHHH', ICMP_ECHO_REQUEST, 0, checksum, 0, cmp_seq_number)
+    global sequence_number
+    sequence_number += 1
+
+    # Generate a dummy header with a 0 checksum
+    header = struct.pack('!BBHHH', ICMP_ECHO_REQUEST, 0, 0, 0, sequence_number)
+
+    # Generate a timestamp for the data
+    data = b'Create better_ping request'
+
+    # Calculate the checksum for the packet
+    checksum = calculate_checksum(header + data)
+
+    # Create the packet with the correct checksum
+    header = struct.pack('!BBHHH', ICMP_ECHO_REQUEST, 0, checksum, 0, sequence_number)
     packet = header + data
-    return packet
+
+    return data, packet
 
 
-# Send an ICMP packet to the specified host
-def send_ping(sock, packet):
+def send_icmp_echo_request(raw_socket, packet):
     """
-    Sends the ICMP packet to the destination.
-    :param sock: Raw socket
-    :param packet: ICMP packet
+    Sends the ICMP echo request packet to the destination IP address.
+
+    param:
+        raw_socket: The raw socket to send the packet.
+        packet: The ICMP echo request packet.
+
+    return:
+        None
     """
     try:
-        sock.sendto(packet, (host, 1))
+        raw_socket.sendto(packet, (destination_host, 1))
     except socket.error:
-        print(f"There is an error in {sock} socket by sending {packet} packet")
-        sock.close()
+        print(f"There is an error in {raw_socket} socket by sending {packet} packet")
+        raw_socket.close()
         exit(1)
 
 
-def receive_ping(better_ping_socket: socket.socket):
+def receive_icmp_echo_reply(ping_socket):
     """
-    Receives and processes ICMP ping reply packets.
-    :param receive_socket: Raw socket for receiving packets
-    :return: Formatted statistics string or 0
+    Receives and processes the ICMP echo reply packet.
+
+    param:
+        ping_socket: The socket to receive the reply packet.
+
+    return:
+        A string representing the statistics of the received reply packet, or 0 if no reply is received.
     """
     start_time = time.time()
-    # not getting anything not blocking the main thread
-    better_ping_socket.setblocking(False)
+
+    # Set socket as non-blocking to not block the main thread
+    ping_socket.setblocking(False)
 
     packet = None
     address = None
 
     try:
-        packet, address = better_ping_socket.recvfrom(1024)
-
+        packet, address = ping_socket.recvfrom(1024)
     except socket.error as e:
-        # if error occurs cause didn't receive anything
+        # If no data received, return 0
         if e.errno == errno.EWOULDBLOCK:
-            better_ping_socket.setblocking(True)
+            ping_socket.setblocking(True)
             return 0
 
     icmp_header = packet[20:28]
 
-    # reads and convert the given back packet data
-    respond_type, code, checksum, p_id, seq_number = struct.unpack(
-        "bbHHh", icmp_header)
-    if respond_type == ICMP_ECHO_REPLY:
-        better_ping_socket.setblocking(True)
-        return f'{len(packet[28:])} bytes from {address[0]} icmp_seq={int(seq_number / 256)}' \
-               f' ttl={packet[8]} time={(time.time() - start_time) * 1000:.3f} ms'
+    # Read and convert the received packet data
+    response = struct.unpack("bbHHh", icmp_header)
+    response_type = response[0]
+    if response_type == ICMP_ECHO_REPLY:
+        ping_socket.setblocking(True)
+        packet_length = len(packet[28:])
+        elapsed_time = (time.time() - start_time) * 1000
+        ttl = packet[8]
+        return f'{packet_length} bytes from {address[0]} icmp_seq={sequence_number} ttl={ttl} time={elapsed_time:.3f} ms'
 
+def run_better_ping_flow(ping_socket, watchdog_thread):
+    """
+    The main flow for sending and receiving ICMP echo request/reply packets.
 
-def better_ping_flow(better_ping_socket, watchdog_thread) -> None:
-    global host
-    host = sys.argv[1]
+    param:
+        ping_socket: The socket for communication with the watchdog process.
+        watchdog_thread: The thread of the watchdog process.
+
+    return:
+        None
+    """
+    global destination_host
+    destination_host = sys.argv[1]
     raw_socket = None
+
     try:
         raw_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-
     except socket.error:
         print('Error: Failed to create socket')
         exit(1)
 
     first_send = True
     status = True
+
     try:
         while watchdog_thread.is_alive():
-            data, packet = create_packet()
-            send_ping(raw_socket, packet)
-            if first_send is True:
-                print(f'PING', host, f'({host})', f'{len(data)} data bytes')
+            data, packet = create_icmp_echo_request_packet()
+            send_icmp_echo_request(raw_socket, packet)
+
+            if first_send:
+                print(f'PING {destination_host} ({destination_host}) {len(data)} data bytes')
                 first_send = False
-            # if got a reply - sends alive message to the watchdog
-            if status is True:
-                better_ping_socket.send("ping".encode())
-            statistics = receive_ping(raw_socket)
+
+            # If a reply is received, send "hello" message to the watchdog
+            if status:
+                ping_socket.send("hello".encode())
+
+            statistics = receive_icmp_echo_reply(raw_socket)
+
             if statistics != 0:
                 print(statistics)
                 status = True
+
             if statistics == 0:
                 time.sleep(1)
                 status = False
                 continue
+
             time.sleep(1)
-        print(f"server {host} cannot be reached.")
+
+        print(f"Server {destination_host} cannot be reached.")
+
     except KeyboardInterrupt:
         print('\nPing stopped, closing program')
+
     finally:
-        better_ping_socket.close()
+        ping_socket.close()
         raw_socket.close()
         exit(1)
 
 
-def create_tcp_socket(watchdog_thread) -> None:
+def create_tcp_socket(watchdog_thread):
+    """
+    Creates a TCP socket and initiates the better_ping flow.
+
+    param:
+        watchdog_thread: The thread of the watchdog process.
+
+    return:
+        None
+    """
     ping_socket = None
+
     try:
         ping_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         ping_socket.connect((WATCHDOG_IP, WATCHDOG_PORT))
-        better_ping_flow(ping_socket, watchdog_thread)
+        run_better_ping_flow(ping_socket, watchdog_thread)
+
     except socket.error:
         print(f"Socket Error {socket.error}")
         if ping_socket is not None:
@@ -159,20 +213,29 @@ def create_tcp_socket(watchdog_thread) -> None:
         exit(1)
 
 
-def better_ping_program() -> None:
+def start_better_ping():
+    """
+    The entry point for starting the better ping process.
+
+    return:
+        None
+    """
     if len(sys.argv) != 2:
-        print('Usage: sudo python3 better_ping.py <ip>')
+        print('Usage: python3 better_ping.py <ip>')
         exit(1)
 
-    # creates watchdog thread, makes it a daemon thread and activates it
+    # Create watchdog thread, make it a daemon thread i.e. the program can exit even if this thread is still running.
+    # then, starting the thread
     watchdog_thread = threading.Thread(target=create_watchdog_tcp_socket)
     watchdog_thread.daemon = True
     watchdog_thread.start()
 
-    # waits for watchdog's TCP to initialize
+    # The purpose is to allow some time for the watchdog's TCP initialization before proceeding.
     time.sleep(1)
+    # Create TCP Socket and Start Better Ping Flow:
     create_tcp_socket(watchdog_thread)
 
 
 if __name__ == '__main__':
-    better_ping_program()
+    start_better_ping()
+

@@ -2,8 +2,8 @@ import socket
 
 # Constant variable
 PORT = 3000
-IP = 'localhost'
-
+IP = ''
+TIMER = 10
 
 def create_watchdog_tcp_socket() -> None:
     """
@@ -38,7 +38,7 @@ def watchdog_timer(better_ping_socket):
     :param better_ping_socket: The socket to receive life signals from
     :return: -1 if no life signal is received for 10 seconds
     """
-    better_ping_socket.settimeout(10)
+    better_ping_socket.settimeout(TIMER)
     try:
         while True:
             better_ping_socket.recv(5)
