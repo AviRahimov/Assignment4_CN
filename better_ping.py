@@ -1,122 +1,178 @@
-import os
-import sys
+import errno
 import socket
 import struct
-import select
+import sys
+import threading
 import time
 
-# ICMP message types
-ICMP_ECHO_REQUEST = 8
-ICMP_ECHO_REPLY = 0
+from ping import ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST
+from watchdog import create_watchdog_tcp_socket
 
-def calculate_checksum(source_string):
-    sum = 0
-    countTo = (len(source_string) // 2) * 2
-    count = 0
-    while count < countTo:
-        thisVal = source_string[count + 1] * 256 + source_string[count]
-        sum += thisVal
-        sum &= 0xffffffff
-        count += 2
+# constants
+WATCHDOG_PORT = 3000
+WATCHDOG_IP = 'localhost'
 
-    if countTo < len(source_string):
-        sum += source_string[len(source_string) - 1]
-        sum &= 0xffffffff
+# global
+host = 0
+seq = 0
 
-    sum = (sum >> 16) + (sum & 0xffff)
-    sum += (sum >> 16)
 
-    answer = ~sum
-    answer &= 0xffff
+def calculate_checksum(packet) -> int:
+    """
+    the code provided in the course
+    :param packet: the packet that calculated with the checksum
+    :return: calculated checksum
+    """
+    """
+    :param packet: 
+    :return: 
+    """
+    checksum = 0
+    count_to = (len(packet) // 2) * 2
+    for i in range(0, count_to, 2):
+        checksum += (packet[i] << 8) + packet[i + 1]
+    if count_to < len(packet):
+        checksum += packet[len(packet) - 1] << 8
+    checksum = (checksum >> 16) + (checksum & 0xFFFF)
+    checksum += checksum >> 16
+    return (~checksum) & 0xFFFF
 
-    answer = answer >> 8 | (answer << 8 & 0xff00)
 
-    return answer
-
-def receive_better_ping_reply(my_socket, ID, timeout):
-    timeLeft = timeout
-
-    while True:
-        start_select = time.time()
-        ready = select.select([my_socket], [], [], timeLeft)
-        select_time = (time.time() - start_select)
-
-        if not ready[0]:
-            return
-
-        timeReceived = time.time()
-        recPacket, addr = my_socket.recvfrom(1024)
-
-        icmpHeader = recPacket[20:28]
-        type_, code_, checksum_, packetID_, sequence_ = struct.unpack("bbHHh", icmpHeader)
-
-        if packetID_ == ID:
-            bytesInDouble = struct.calcsize("d")
-            timeSent = struct.unpack("d", recPacket[28:28 + bytesInDouble])[0]
-            ttl = ord(struct.unpack("c", recPacket[8:9])[0])
-            packet_size = len(recPacket)  # Get packet size
-            return timeReceived - timeSent, ttl, packet_size
-
-        timeLeft -= select_time
-
-        if timeLeft <= 0:
-            return
-
-def send_better_ping_request(my_socket, dest_addr, ID, sequence):
-    dest_addr = socket.gethostbyname(dest_addr)
-
-    my_checksum = 0
-
-    header = struct.pack("bbHHh", ICMP_ECHO_REQUEST, 0, my_checksum, ID, sequence)
-    data = struct.pack("d", time.time())
-    my_checksum = calculate_checksum(header + data)
-
-    header = struct.pack("bbHHh", ICMP_ECHO_REQUEST, 0, socket.htons(my_checksum), ID, sequence)
+# Create an ICMP packet
+def create_packet(payload_size: int) -> bytes:
+    """
+    Creates an ICMP packet with the specified payload size.
+    :param payload_size: Size of the payload
+    :return: ICMP packet
+    """
+    global cmp_seq_number
+    cmp_seq_number += 1
+    packet = struct.pack('!BBHHH', ICMP_ECHO_REQUEST, 0, 0, 0, cmp_seq_number)  # Create the ICMP header
+    data = b'P' * payload_size  # Create the payload data
+    packet += data
+    checksum = calculate_checksum(packet)
+    # creates an header with checksum
+    header = struct.pack('!BBHHH', ICMP_ECHO_REQUEST, 0, checksum, 0, cmp_seq_number)
     packet = header + data
+    return packet
 
-    my_socket.sendto(packet, (dest_addr, 1))
 
-def perform_better_ping(addr, timeout, sequence):
-    icmp = socket.getprotobyname("icmp")
+# Send an ICMP packet to the specified host
+def send_ping(sock, packet):
+    """
+    Sends the ICMP packet to the destination.
+    :param sock: Raw socket
+    :param packet: ICMP packet
+    """
+    try:
+        sock.sendto(packet, (host, 1))
+    except socket.error:
+        print(f"There is an error in {sock} socket by sending {packet} packet")
+        sock.close()
+        exit(1)
+
+
+def receive_ping(better_ping_socket: socket.socket):
+    """
+    Receives and processes ICMP ping reply packets.
+    :param receive_socket: Raw socket for receiving packets
+    :return: Formatted statistics string or 0
+    """
+    start_time = time.time()
+    # not getting anything not blocking the main thread
+    better_ping_socket.setblocking(False)
+
+    packet = None
+    address = None
 
     try:
-        my_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, icmp)
+        packet, address = better_ping_socket.recvfrom(1024)
+
     except socket.error as e:
-        if e.errno == 1:
-            msg = "Operation not permitted"
-            raise socket.error(msg)
+        # if error occurs cause didn't receive anything
+        if e.errno == errno.EWOULDBLOCK:
+            better_ping_socket.setblocking(True)
+            return 0
 
-        raise
+    icmp_header = packet[20:28]
 
-    my_ID = os.getpid() & 0xFFFF
+    # reads and convert the given back packet data
+    respond_type, code, checksum, p_id, seq_number = struct.unpack(
+        "bbHHh", icmp_header)
+    if respond_type == ICMP_ECHO_REPLY:
+        better_ping_socket.setblocking(True)
+        return f'{len(packet[28:])} bytes from {address[0]} icmp_seq={int(seq_number / 256)}' \
+               f' ttl={packet[8]} time={(time.time() - start_time) * 1000:.3f} ms'
 
-    send_better_ping_request(my_socket, addr, my_ID, sequence)
-    result = receive_better_ping_reply(my_socket, my_ID, timeout)
 
-    my_socket.close()
+def better_ping_flow(better_ping_socket, watchdog_thread) -> None:
+    global host
+    host = sys.argv[1]
+    raw_socket = None
+    try:
+        raw_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
 
-    return result
+    except socket.error:
+        print('Error: Failed to create socket')
+        exit(1)
 
-def better_ping_program():
-    if len(sys.argv) < 2:
-        print("Usage: python better_ping.py <host>")
-        return
+    first_send = True
+    status = True
+    try:
+        while watchdog_thread.is_alive():
+            data, packet = create_packet()
+            send_ping(raw_socket, packet)
+            if first_send is True:
+                print(f'PING', host, f'({host})', f'{len(data)} data bytes')
+                first_send = False
+            # if got a reply - sends alive message to the watchdog
+            if status is True:
+                better_ping_socket.send("ping".encode())
+            statistics = receive_ping(raw_socket)
+            if statistics != 0:
+                print(statistics)
+                status = True
+            if statistics == 0:
+                time.sleep(1)
+                status = False
+                continue
+            time.sleep(1)
+        print(f"server {host} cannot be reached.")
+    except KeyboardInterrupt:
+        print('\nPing stopped, closing program')
+    finally:
+        better_ping_socket.close()
+        raw_socket.close()
+        exit(1)
 
-    addr = sys.argv[1]
 
-    sequence = 0  # Initialize sequence number
+def create_tcp_socket(watchdog_thread) -> None:
+    ping_socket = None
+    try:
+        ping_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        ping_socket.connect((WATCHDOG_IP, WATCHDOG_PORT))
+        better_ping_flow(ping_socket, watchdog_thread)
+    except socket.error:
+        print(f"Socket Error {socket.error}")
+        if ping_socket is not None:
+            ping_socket.close()
+        exit(1)
 
-    while True:
-        sequence += 1  # Increment sequence number
 
-        result = perform_better_ping(addr, 1, sequence)
-        if result is not None:
-            rtt, ttl, packet_size = result
-            print(f"Reply from {addr}: seq_num={sequence}, rtt={rtt:.5f}ms, ttl={ttl}, size={packet_size} bytes")
-        else:
-            print(f"Request timed out: seq={sequence}")
+def better_ping_program() -> None:
+    if len(sys.argv) != 2:
+        print('Usage: sudo python3 better_ping.py <ip>')
+        exit(1)
 
-        time.sleep(1)
+    # creates watchdog thread, makes it a daemon thread and activates it
+    watchdog_thread = threading.Thread(target=create_watchdog_tcp_socket)
+    watchdog_thread.daemon = True
+    watchdog_thread.start()
 
-if __name__ == "__main__":
+    # waits for watchdog's TCP to initialize
+    time.sleep(1)
+    create_tcp_socket(watchdog_thread)
+
+
+if __name__ == '__main__':
     better_ping_program()

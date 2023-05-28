@@ -4,6 +4,7 @@ import socket
 PORT = 3000
 IP = 'localhost'
 
+
 def create_watchdog_tcp_socket() -> None:
     """
     Creates a watchdog TCP socket and opens the watchdog timer.
